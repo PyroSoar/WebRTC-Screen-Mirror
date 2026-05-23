@@ -14,25 +14,31 @@ export const PinInput = React.forwardRef<HTMLInputElement, PinInputProps>(
 		const { count = 4, inputProps, rootRef, attached, autoFocus, ...rest } = props;
 		const containerRef = React.useRef<HTMLDivElement>(null);
 
-		// Imperatively focus the first visible input on mount when autoFocus is set.
-		// We can't rely on the zag-js machine's autoFocus prop because Chakra's
-		// withProvider HOC only forwards `mask`, not `autoFocus`, to the machine.
+		// Chakra's withProvider HOC only forwards "mask" to the zag-js machine,
+		// so the machine's built-in autoFocus never fires. We implement it
+		// imperatively: after the component paints, find the first visible input
+		// via the data-ownedby attribute that zag-js sets on each digit input.
 		React.useEffect(() => {
 			if (!autoFocus) return;
-			const first = containerRef.current?.querySelector<HTMLInputElement>(
-				"input:not([type=hidden])"
-			);
-			first?.focus();
+			const el = containerRef.current;
+			if (!el) return;
+			// Use rAF so the effect runs after the browser has painted the inputs
+			const frame = requestAnimationFrame(() => {
+				const first = el.querySelector<HTMLInputElement>("input[data-ownedby]");
+				first?.focus();
+			});
+			return () => cancelAnimationFrame(frame);
 		}, [autoFocus]);
 
-		const mergedRef = (el: HTMLDivElement | null) => {
+		// Merge our internal ref with any external rootRef passed by the caller
+		const mergedRootRef = React.useCallback((el: HTMLDivElement | null) => {
 			(containerRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
 			if (typeof rootRef === "function") rootRef(el);
 			else if (rootRef) (rootRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
-		};
+		}, [rootRef]);
 
 		return (
-			<ChakraPinInput.Root ref={mergedRef} {...rest} style={{ width: "100%" }}>
+			<ChakraPinInput.Root ref={mergedRootRef} {...rest} style={{ width: "100%" }}>
 				<ChakraPinInput.HiddenInput ref={ref} {...inputProps} />
 				<ChakraPinInput.Control style={{ display: "flex", width: "100%" }}>
 					<Group attached={attached} style={{ display: "flex", width: "100%" }}>
