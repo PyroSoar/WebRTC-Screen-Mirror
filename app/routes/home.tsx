@@ -170,20 +170,14 @@ export default function Home() {
 
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const audioRef = useRef<HTMLAudioElement>(null);
-	const pinRootRef = useRef<HTMLDivElement>(null);
+
 	const wasConnectedRef = useRef(false);
 	const retryCodeRef = useRef("");
 	const pendingPinFiredRef = useRef(false);
 
 	// ── UI state ───────────────────────────────────────────────────────────────
 	const [mode, setMode] = useState<AppMode>(null);
-	const goViewer = useCallback(() => {
-		setMode("viewer");
-		setTimeout(() => {
-			const first = pinRootRef.current?.querySelector<HTMLInputElement>("input:not([type=hidden])");
-			first?.focus();
-		}, 50);
-	}, []);
+	const goViewer = useCallback(() => setMode("viewer"), []);
 	const [toast, setToast] = useState<ToastMsg | null>(null);
 	const [cfLocation, setCfLocation] = useState<CfLocation | null>(null);
 
@@ -830,14 +824,20 @@ function QrModal({ url, onClose }: { url: string; onClose: () => void }) {
 
 function SelfPreview({ localStream }: { localStream: MediaStream | null }) {
 	const videoRef = useRef<HTMLVideoElement>(null);
+	const audioRef = useRef<HTMLAudioElement>(null);
 	const [expanded, setExpanded] = useState(false);
 	const hasVideoTrack = Boolean(localStream?.getVideoTracks().some(t => t.readyState === "live"));
 
 	useEffect(() => {
-		const vid = videoRef.current;
-		if (!vid || !localStream) return;
-		if (vid.srcObject !== localStream) vid.srcObject = localStream;
-	}, [localStream, expanded]);
+		if (!expanded || !localStream) return;
+		if (hasVideoTrack) {
+			const vid = videoRef.current;
+			if (vid && vid.srcObject !== localStream) vid.srcObject = localStream;
+		} else {
+			const aud = audioRef.current;
+			if (aud && aud.srcObject !== localStream) aud.srcObject = localStream;
+		}
+	}, [localStream, expanded, hasVideoTrack]);
 
 	if (!localStream) return null;
 
@@ -853,22 +853,21 @@ function SelfPreview({ localStream }: { localStream: MediaStream | null }) {
 			</Button>
 			{expanded && (
 				hasVideoTrack ? (
-					<Box borderRadius="md" overflow="hidden" bg="black" w="full" maxH="200px">
+					// No fixed height/maxH — let the video's natural aspect ratio determine height.
+					// controls=true shows the browser's native control bar.
+					<Box borderRadius="md" overflow="hidden" w="full">
 						<video
 							ref={videoRef}
 							autoPlay
 							playsInline
 							muted
-							style={{ width: "100%", maxHeight: "200px", objectFit: "contain", display: "block" }}
+							controls
+							style={{ width: "100%", display: "block" }}
 						/>
 					</Box>
 				) : (
 					<Box px={3} py={2} borderRadius="md" bg="bg.subtle">
-						<audio ref={videoRef as any} autoPlay muted />
-						<HStack gap={2} color="fg.muted">
-							<MicIcon size={14} />
-							<Text fontSize="sm">音频广播中（无视频）</Text>
-						</HStack>
+						<audio ref={audioRef} autoPlay muted controls style={{ width: "100%" }} />
 					</Box>
 				)
 			)}
