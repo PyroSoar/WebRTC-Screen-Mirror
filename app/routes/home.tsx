@@ -170,12 +170,20 @@ export default function Home() {
 
 	const videoRef = useRef<HTMLVideoElement>(null);
 	const audioRef = useRef<HTMLAudioElement>(null);
+	const pinRootRef = useRef<HTMLDivElement>(null);
 	const wasConnectedRef = useRef(false);
 	const retryCodeRef = useRef("");
 	const pendingPinFiredRef = useRef(false);
 
 	// ── UI state ───────────────────────────────────────────────────────────────
 	const [mode, setMode] = useState<AppMode>(null);
+	const goViewer = useCallback(() => {
+		setMode("viewer");
+		setTimeout(() => {
+			const first = pinRootRef.current?.querySelector<HTMLInputElement>("input:not([type=hidden])");
+			first?.focus();
+		}, 50);
+	}, []);
 	const [toast, setToast] = useState<ToastMsg | null>(null);
 	const [cfLocation, setCfLocation] = useState<CfLocation | null>(null);
 
@@ -414,57 +422,62 @@ export default function Home() {
 	// ── Broadcaster view ──────────────────────────────────────────────────────
 	// ══════════════════════════════════════════════════════════════════════════
 	if (isBroadcasting) {
+		const shareUrl = typeof window !== "undefined"
+			? `${window.location.origin}${window.location.pathname}?pin=${id}` : "";
 		return (
-			<VStack p={4} pt={16} h="dvh" gap={6} maxW="550px" mx="auto" w="full">
+			<VStack p={4} pt={16} pb={8} gap={5} maxW="550px" mx="auto" w="full" overflowY="auto">
 				<WsBanner />
 				<Toast msg={toast} onClose={() => setToast(null)} />
 
-				<VStack gap={2} textAlign="center">
+				{/* 1. 正在广播 */}
+				<VStack gap={1} textAlign="center">
 					<HStack><MonitorIcon size={20} /><Text fontWeight="semibold">正在广播</Text></HStack>
 					<Text fontSize="sm" color="fg.muted">将以下广播码分享给想要观看的人</Text>
 				</VStack>
 
+				{/* 2. 你的广播码 label */}
+				<Text fontSize="sm" color="fg.muted">你的广播码</Text>
 
+				{/* 3. Pin + copy */}
+				<HStack gap={3}>
+					<Text fontSize="4xl" fontWeight="bold" letterSpacing={6} fontFamily="mono">{id}</Text>
+					<Button size="sm" variant="ghost" onClick={onCopyCode} title="复制广播码">
+						{codeCopied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
+					</Button>
+				</HStack>
 
+				{/* 4. 3 share buttons */}
+				<HStack gap={2} flexWrap="wrap" justify="center">
+					<Button size="sm" variant="outline" onClick={onCopyShareLink} gap={1}>
+						<CopyIcon size={13} />复制分享链接
+					</Button>
+					<Button size="sm" variant="outline" onClick={() => setShowQr(true)} gap={1}>
+						<QrCodeIcon size={13} />查看二维码
+					</Button>
+					<Button size="sm" variant="outline" onClick={onCopyQrCode} gap={1}>
+						<QrCodeIcon size={13} />复制二维码
+					</Button>
+				</HStack>
+
+				{/* 5. 停止广播 */}
+				<Button colorPalette="red" variant="subtle" onClick={() => webRTCService.stopBroadcast()}>
+					停止广播
+				</Button>
+
+				{/* 6. Info panel */}
+				{streamInfo && <StreamInfoPanel info={streamInfo} cfLocation={cfLocation} />}
+
+				{/* 7. Self-preview (collapsed by default) */}
+				<SelfPreview localStream={webRTCService.getLocalStream()} />
+
+				{/* 8. Viewer count */}
 				<HStack gap={2}>
 					<UsersIcon size={16} />
 					<Text fontSize="sm">{viewerCount === 0 ? "暂无观看者" : `${viewerCount} 人正在观看`}</Text>
 					{viewerCount > 0 && <Badge colorPalette="green" variant="subtle">{viewerCount}</Badge>}
 				</HStack>
 
-				{streamInfo && <StreamInfoPanel info={streamInfo} cfLocation={cfLocation} />}
-
-				<VStack gap={2} w="full" align="center">
-					<Text fontSize="sm" color="fg.muted">你的广播码</Text>
-					<HStack gap={3}>
-						<Text fontSize="4xl" fontWeight="bold" letterSpacing={6} fontFamily="mono">{id}</Text>
-						<Button size="sm" variant="ghost" onClick={onCopyCode} title="复制广播码">
-							{codeCopied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
-						</Button>
-					</HStack>
-					<HStack gap={2} flexWrap="wrap" justify="center">
-						<Button size="sm" variant="outline" onClick={onCopyShareLink} gap={1}>
-							<CopyIcon size={13} />复制分享链接
-						</Button>
-						<Button size="sm" variant="outline" onClick={() => setShowQr(true)} gap={1}>
-							<QrCodeIcon size={13} />查看二维码
-						</Button>
-						<Button size="sm" variant="outline" onClick={onCopyQrCode} gap={1}>
-							<QrCodeIcon size={13} />复制二维码
-						</Button>
-					</HStack>
-				</VStack>
-
-				<Button colorPalette="red" variant="subtle" onClick={() => webRTCService.stopBroadcast()}>
-					停止广播
-				</Button>
-
-				{showQr && (
-					<QrModal
-						url={`${typeof window !== "undefined" ? window.location.origin + window.location.pathname : ""}?pin=${id}`}
-						onClose={() => setShowQr(false)}
-					/>
-				)}
+				{showQr && <QrModal url={shareUrl} onClose={() => setShowQr(false)} />}
 			</VStack>
 		);
 	}
@@ -551,8 +564,10 @@ export default function Home() {
 						>
 							<VStack align="start" gap={1}>
 								<Text fontWeight="bold" fontSize="sm">媒体信息</Text>
-								<Text>原始分辨率：{sourceRes ? `${sourceRes.w}×${sourceRes.h}` : "检测中..."}</Text>
-								<Text>当前分辨率：{currentRes ? `${currentRes.w}×${currentRes.h}` : "检测中..."}</Text>
+								{hasVideo && <>
+									<Text>原始分辨率：{sourceRes ? `${sourceRes.w}×${sourceRes.h}` : "检测中..."}</Text>
+									<Text>当前分辨率：{currentRes ? `${currentRes.w}×${currentRes.h}` : "检测中..."}</Text>
+								</>}
 								<Text>音频：{remoteStream?.getAudioTracks().length ? "有" : "无"}</Text>
 								{cfLocation && (
 									<HStack gap={1} color="whiteAlpha.600">
@@ -570,7 +585,7 @@ export default function Home() {
 					style={{ background: "rgba(0,0,0,0.75)", flexShrink: 0 }}
 				>
 					<HStack gap={1} flex={1} flexWrap="wrap">
-						{!connBroken && visibleResolutions.map(r => (
+						{!connBroken && hasVideo && visibleResolutions.map(r => (
 							<Button key={r.key} size="xs"
 								variant={selectedRes === r.key ? "solid" : "ghost"}
 								color={selectedRes === r.key ? undefined : "white"}
@@ -612,7 +627,7 @@ export default function Home() {
 
 			{mode === null && (
 				<VStack w="full" gap={3}>
-					<Button w="full" size="lg" variant="outline" gap={2} onClick={() => setMode("viewer")}>
+					<Button w="full" size="lg" variant="outline" gap={2} onClick={goViewer}>
 						<EyeIcon size={18} />我要观看
 					</Button>
 					<Button w="full" size="lg" variant="subtle" gap={2} onClick={() => setMode("broadcaster")}>
@@ -810,5 +825,53 @@ function QrModal({ url, onClose }: { url: string; onClose: () => void }) {
 				<Button size="sm" variant="ghost" onClick={onClose} w="full">关闭</Button>
 			</VStack>
 		</Box>
+	);
+}
+
+function SelfPreview({ localStream }: { localStream: MediaStream | null }) {
+	const videoRef = useRef<HTMLVideoElement>(null);
+	const [expanded, setExpanded] = useState(false);
+	const hasVideoTrack = Boolean(localStream?.getVideoTracks().some(t => t.readyState === "live"));
+
+	useEffect(() => {
+		const vid = videoRef.current;
+		if (!vid || !localStream) return;
+		if (vid.srcObject !== localStream) vid.srcObject = localStream;
+	}, [localStream, expanded]);
+
+	if (!localStream) return null;
+
+	return (
+		<VStack w="full" align="stretch" gap={2}>
+			<Button
+				size="sm" variant="ghost"
+				onClick={() => setExpanded(v => !v)}
+				gap={2} justifyContent="flex-start"
+			>
+				{expanded ? "▲" : "▼"}
+				{hasVideoTrack ? "预览本地画面" : "预览本地音频"}
+			</Button>
+			{expanded && (
+				hasVideoTrack ? (
+					<Box borderRadius="md" overflow="hidden" bg="black" w="full" maxH="200px">
+						<video
+							ref={videoRef}
+							autoPlay
+							playsInline
+							muted
+							style={{ width: "100%", maxHeight: "200px", objectFit: "contain", display: "block" }}
+						/>
+					</Box>
+				) : (
+					<Box px={3} py={2} borderRadius="md" bg="bg.subtle">
+						<audio ref={videoRef as any} autoPlay muted />
+						<HStack gap={2} color="fg.muted">
+							<MicIcon size={14} />
+							<Text fontSize="sm">音频广播中（无视频）</Text>
+						</HStack>
+					</Box>
+				)
+			)}
+		</VStack>
 	);
 }

@@ -408,6 +408,10 @@ class WebRTCService {
 		}
 	}
 
+	getLocalStream(): MediaStream | null {
+		return this.localStream;
+	}
+
 	disconnectViewer(): void {
 		const store = useWebRTCStore.getState();
 		store.setConnectionState("disconnected");
