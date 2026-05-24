@@ -64,22 +64,56 @@ function getInitialPin(): string | null {
 	return pin && /^\d{6}$/.test(pin) ? pin : null;
 }
 
+// IATA airport code → Chinese city name (Cloudflare PoP codes)
+const IATA_CITY: Record<string, string> = {
+	AMS:"阿姆斯特丹", ATL:"亚特兰大", BKK:"曼谷", BOM:"孟买", BOS:"波士顿",
+	CAN:"广州", CDG:"巴黎", CPH:"哥本哈根", DEL:"新德里", DFW:"达拉斯",
+	DOH:"多哈", DUB:"都柏林", EWR:"纽约", FCO:"罗马", FRA:"法兰克福",
+	GRU:"圣保罗", HAN:"河内", HEL:"赫尔辛基", HKG:"香港", HND:"东京",
+	IAD:"华盛顿", IAH:"休斯顿", ICN:"首尔", JFK:"纽约", JNB:"约翰内斯堡",
+	KIX:"大阪", KUL:"吉隆坡", LAX:"洛杉矶", LHR:"伦敦", LIS:"里斯本",
+	MAD:"马德里", MEL:"墨尔本", MEX:"墨西哥城", MIA:"迈阿密", MNL:"马尼拉",
+	MUC:"慕尼黑", MXP:"米兰", NRT:"东京", ORD:"芝加哥", OSL:"奥斯陆",
+	PEK:"北京", PDX:"波特兰", PVG:"上海", SCL:"圣地亚哥", SEA:"西雅图",
+	SFO:"旧金山", SIN:"新加坡", SJC:"圣何塞", SYD:"悉尼", TLV:"特拉维夫",
+	TPE:"台北", VIE:"维也纳", WAW:"华沙", YYZ:"多伦多", ZRH:"苏黎世",
+};
+
+const COUNTRY_NAME: Record<string, string> = {
+	US:"美国", CN:"中国", HK:"中国香港", TW:"中国台湾", SG:"新加坡",
+	JP:"日本", KR:"韩国", GB:"英国", DE:"德国", FR:"法国",
+	NL:"荷兰", AU:"澳大利亚", CA:"加拿大", IN:"印度", BR:"巴西",
+};
+
+let cfLocationCache: CfLocation | null = null;
+
 async function fetchCfLocation(): Promise<CfLocation | null> {
+	if (cfLocationCache) return cfLocationCache;
 	try {
-		const res = await fetch("https://speed.cloudflare.com/meta");
+		// /cdn-cgi/trace is same-origin on any Cloudflare-proxied site — no CORS needed
+		const res = await fetch("/cdn-cgi/trace", { cache: "no-store" });
 		if (!res.ok) return null;
-		const d = await res.json();
-		const colo = typeof d.colo === "string" ? d.colo
-			: typeof d.colo === "object" && d.colo?.iata ? d.colo.iata
-			: typeof d.iata === "string" ? d.iata : "?";
-		return { colo, city: d.city, country: d.country };
+		const text = await res.text();
+		const get = (key: string) => text.match(new RegExp(`^${key}=(.+)$`, "m"))?.[1]?.trim() ?? "";
+		const colo = get("colo");
+		const loc = get("loc");
+		cfLocationCache = {
+			colo,
+			city: IATA_CITY[colo] ?? colo,
+			country: COUNTRY_NAME[loc] ?? loc,
+		};
+		return cfLocationCache;
 	} catch {
 		return null;
 	}
 }
 
 function formatCfLocation(loc: CfLocation): string {
-	const parts = [loc.city, loc.country].filter(Boolean).join(", ");
+	// city already comes from IATA_CITY (Chinese name); country from COUNTRY_NAME
+	// Omit country when it would duplicate city (e.g. Singapore)
+	const parts = (loc.city !== loc.country && loc.country)
+		? `${loc.city}, ${loc.country}`
+		: loc.city;
 	return parts ? `${loc.colo} · ${parts}` : loc.colo;
 }
 

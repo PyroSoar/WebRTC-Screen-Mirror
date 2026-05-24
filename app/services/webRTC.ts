@@ -4,9 +4,9 @@ import { webSocketService } from "~/services/webSocket";
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type BroadcastError =
-	| { code: "NOT_SUPPORTED"; message: string }
+	| { code: "NOT_SUPPORTED";    message: string }
 	| { code: "PERMISSION_DENIED"; message: string }
-	| { code: "UNKNOWN"; message: string };
+	| { code: "UNKNOWN";          message: string };
 
 type VideoSource = "screen" | "camera" | "both";
 type AudioSource = "screen" | "microphone" | "both";
@@ -27,30 +27,31 @@ const RTC_CONFIG: RTCConfiguration = {
 	],
 };
 
-const PIP_WIDTH = 240;
-const PIP_HEIGHT = 135;
-const PIP_MARGIN = 16;
-const PIP_RADIUS = 10;
-const CANVAS_WIDTH = 1280;
-const CANVAS_HEIGHT = 720;
+const CANVAS_W   = 1280;
+const CANVAS_H   = 720;
 const CANVAS_FPS = 30;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const PIP_W      = 240;
+const PIP_H      = 135;
+const PIP_MARGIN = 16;
+const PIP_RADIUS = 10;
 
-function makeBroadcastError(code: BroadcastError["code"], message: string): BroadcastError {
+// ─── Module helpers ───────────────────────────────────────────────────────────
+
+function broadcastError(code: BroadcastError["code"], message: string): BroadcastError {
 	return { code, message };
 }
 
-function stopTracks(stream: MediaStream | null) {
+function stopTracks(stream: MediaStream | null): void {
 	stream?.getTracks().forEach(t => t.stop());
 }
 
-function needsDisplay(opts: Pick<BroadcastOptions, "videoSource" | "audioSource">): boolean {
+function requiresDisplayMedia(opts: Pick<BroadcastOptions, "videoSource" | "audioSource">): boolean {
 	return opts.videoSource === "screen" || opts.videoSource === "both"
-		|| opts.audioSource === "screen" || opts.audioSource === "both";
+		|| opts.audioSource === "screen"  || opts.audioSource === "both";
 }
 
-function needsUserMedia(opts: Pick<BroadcastOptions, "videoSource" | "audioSource">): boolean {
+function requiresUserMedia(opts: Pick<BroadcastOptions, "videoSource" | "audioSource">): boolean {
 	return opts.videoSource === "camera" || opts.videoSource === "both"
 		|| opts.audioSource === "microphone" || opts.audioSource === "both";
 }
@@ -60,40 +61,36 @@ function needsUserMedia(opts: Pick<BroadcastOptions, "videoSource" | "audioSourc
 class WebRTCService {
 	private static instance: WebRTCService;
 
-	// Broadcaster: one RTCPeerConnection per viewer
-	private viewerPeers = new Map<string, RTCPeerConnection>();
-	private localStream: MediaStream | null = null;
-	private canvasAnimFrame: number | null = null;
+	// Broadcaster role: one peer connection per viewer
+	private viewerPeers   = new Map<string, RTCPeerConnection>();
+	private localStream:    MediaStream | null = null;
+	private animFrameId:    number | null = null;
 
-	// Viewer: single connection to the broadcaster
-	private broadcasterPc: RTCPeerConnection | null = null;
-	private broadcasterPeerId = "";
+	// Viewer role: one peer connection to the broadcaster
+	private broadcasterPc:     RTCPeerConnection | null = null;
+	private broadcasterPeerId: string = "";
 
 	private constructor() {
-		webSocketService.registerHandler("ice_candidate", ({ from, data }) => {
+		webSocketService.registerHandler("ice_candidate", ({ from, data }: any) => {
 			const pc = this.viewerPeers.get(from)
 				?? (this.broadcasterPeerId === from ? this.broadcasterPc : null);
 			pc?.addIceCandidate(new RTCIceCandidate(data)).catch(console.error);
 		});
 
-		// Broadcaster receives answers from viewers
-		webSocketService.registerHandler("answer", ({ from, data }) => {
+		webSocketService.registerHandler("answer", ({ from, data }: any) => {
 			this.viewerPeers.get(from)
 				?.setRemoteDescription(new RTCSessionDescription(data))
 				.catch(console.error);
 		});
 
-		// Broadcaster receives resolution requests from viewers
-		webSocketService.registerHandler("set_resolution", ({ from, data }) => {
+		webSocketService.registerHandler("set_resolution", ({ from, data }: any) => {
 			const pc = this.viewerPeers.get(from);
 			if (!pc) return;
-
 			const { maxWidth, maxHeight } = data as { maxWidth: number; maxHeight: number };
-			const sourceSettings = this.localStream?.getVideoTracks()[0]?.getSettings();
-			const srcW = sourceSettings?.width ?? maxWidth;
-			const srcH = sourceSettings?.height ?? maxHeight;
-			const scale = Math.max(1, Math.max(srcW / maxWidth, srcH / maxHeight));
-
+			const srcSettings = this.localStream?.getVideoTracks()[0]?.getSettings();
+			const srcW  = srcSettings?.width  ?? maxWidth;
+			const srcH  = srcSettings?.height ?? maxHeight;
+			const scale = Math.max(1, srcW / maxWidth, srcH / maxHeight);
 			for (const sender of pc.getSenders()) {
 				if (sender.track?.kind !== "video") continue;
 				const params = sender.getParameters();
@@ -109,91 +106,91 @@ class WebRTCService {
 		return WebRTCService.instance;
 	}
 
-	// ─── Capability checks ────────────────────────────────────────────────────
+	// ─── Capability check ─────────────────────────────────────────────────────
 
 	checkBroadcastSupport(opts: BroadcastOptions): BroadcastError | null {
-		if (needsDisplay(opts) && typeof navigator?.mediaDevices?.getDisplayMedia !== "function") {
-			return makeBroadcastError("NOT_SUPPORTED",
+		if (requiresDisplayMedia(opts) && typeof navigator?.mediaDevices?.getDisplayMedia !== "function") {
+			return broadcastError("NOT_SUPPORTED",
 				"此设备/浏览器不支持屏幕捕获。请在桌面浏览器上使用屏幕/屏幕声音功能。");
 		}
-		if (needsUserMedia(opts) && typeof navigator?.mediaDevices?.getUserMedia !== "function") {
-			return makeBroadcastError("NOT_SUPPORTED", "此设备/浏览器不支持摄像头/麦克风访问。");
+		if (requiresUserMedia(opts) && typeof navigator?.mediaDevices?.getUserMedia !== "function") {
+			return broadcastError("NOT_SUPPORTED", "此设备/浏览器不支持摄像头/麦克风访问。");
 		}
 		return null;
 	}
 
 	// ─── Canvas compositor (screen + camera PiP) ──────────────────────────────
 
-	private startCanvasCompositor(screenStream: MediaStream, cameraStream: MediaStream): MediaStream {
+	private startCompositor(screenStream: MediaStream, cameraStream: MediaStream): MediaStream {
 		const canvas = document.createElement("canvas");
-		canvas.width = CANVAS_WIDTH;
-		canvas.height = CANVAS_HEIGHT;
+		canvas.width  = CANVAS_W;
+		canvas.height = CANVAS_H;
 		const ctx = canvas.getContext("2d")!;
 
-		const makeVideo = (stream: MediaStream) => {
+		const makeVideoEl = (stream: MediaStream): HTMLVideoElement => {
 			const v = document.createElement("video");
 			v.srcObject = stream;
-			v.muted = true;
-			v.autoplay = true;
+			v.muted     = true;
+			v.autoplay  = true;
 			v.play().catch(console.error);
 			return v;
 		};
 
-		const screenVid = makeVideo(screenStream);
-		const cameraVid = makeVideo(cameraStream);
+		const screenEl = makeVideoEl(screenStream);
+		const cameraEl = makeVideoEl(cameraStream);
 
-		const pipX = CANVAS_WIDTH - PIP_WIDTH - PIP_MARGIN;
-		const pipY = CANVAS_HEIGHT - PIP_HEIGHT - PIP_MARGIN;
+		const pipX = CANVAS_W - PIP_W - PIP_MARGIN;
+		const pipY = CANVAS_H - PIP_H - PIP_MARGIN;
 
 		const draw = () => {
-			// Background: screen
-			if (screenVid.readyState >= 2) {
-				ctx.drawImage(screenVid, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+			// Full-canvas screen background
+			if (screenEl.readyState >= 2) {
+				ctx.drawImage(screenEl, 0, 0, CANVAS_W, CANVAS_H);
 			} else {
 				ctx.fillStyle = "#000";
-				ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+				ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 			}
 
-			// PiP: camera
-			if (cameraVid.readyState >= 2) {
-				const vw = cameraVid.videoWidth || PIP_WIDTH;
-				const vh = cameraVid.videoHeight || PIP_HEIGHT;
-				const scale = Math.min(PIP_WIDTH / vw, PIP_HEIGHT / vh);
-				const dw = vw * scale;
-				const dh = vh * scale;
-				const dx = pipX + (PIP_WIDTH - dw) / 2;
-				const dy = pipY + (PIP_HEIGHT - dh) / 2;
+			// Camera PiP — letterboxed, rounded, with border
+			if (cameraEl.readyState >= 2) {
+				const vw    = cameraEl.videoWidth  || PIP_W;
+				const vh    = cameraEl.videoHeight || PIP_H;
+				const scale = Math.min(PIP_W / vw, PIP_H / vh);
+				const dw    = vw * scale;
+				const dh    = vh * scale;
+				const dx    = pipX + (PIP_W - dw) / 2;
+				const dy    = pipY + (PIP_H - dh) / 2;
 
 				ctx.save();
 				ctx.beginPath();
-				ctx.roundRect(pipX, pipY, PIP_WIDTH, PIP_HEIGHT, PIP_RADIUS);
+				ctx.roundRect(pipX, pipY, PIP_W, PIP_H, PIP_RADIUS);
 				ctx.clip();
 				ctx.fillStyle = "#111";
-				ctx.fillRect(pipX, pipY, PIP_WIDTH, PIP_HEIGHT);
-				ctx.drawImage(cameraVid, dx, dy, dw, dh);
+				ctx.fillRect(pipX, pipY, PIP_W, PIP_H);
+				ctx.drawImage(cameraEl, dx, dy, dw, dh);
 				ctx.restore();
 
 				ctx.save();
 				ctx.strokeStyle = "rgba(255,255,255,0.7)";
-				ctx.lineWidth = 2;
+				ctx.lineWidth   = 2;
 				ctx.beginPath();
-				ctx.roundRect(pipX, pipY, PIP_WIDTH, PIP_HEIGHT, PIP_RADIUS);
+				ctx.roundRect(pipX, pipY, PIP_W, PIP_H, PIP_RADIUS);
 				ctx.stroke();
 				ctx.restore();
 			}
 
-			this.canvasAnimFrame = requestAnimationFrame(draw);
+			this.animFrameId = requestAnimationFrame(draw);
 		};
 
 		draw();
-		// @ts-ignore — captureStream exists on HTMLCanvasElement
+		// @ts-ignore — captureStream is widely supported but absent from lib.dom.d.ts
 		return canvas.captureStream(CANVAS_FPS) as MediaStream;
 	}
 
-	private stopCanvasCompositor() {
-		if (this.canvasAnimFrame !== null) {
-			cancelAnimationFrame(this.canvasAnimFrame);
-			this.canvasAnimFrame = null;
+	private stopCompositor(): void {
+		if (this.animFrameId !== null) {
+			cancelAnimationFrame(this.animFrameId);
+			this.animFrameId = null;
 		}
 	}
 
@@ -206,16 +203,16 @@ class WebRTCService {
 		if (supportError) throw supportError;
 
 		let screenStream: MediaStream | null = null;
-		let userStream: MediaStream | null = null;
+		let userStream:   MediaStream | null = null;
 
 		try {
-			if (needsDisplay(opts)) {
+			if (requiresDisplayMedia(opts)) {
 				screenStream = await navigator.mediaDevices.getDisplayMedia({
 					video: true,
 					audio: audioSource === "screen" || audioSource === "both",
 				});
 			}
-			if (needsUserMedia(opts)) {
+			if (requiresUserMedia(opts)) {
 				userStream = await navigator.mediaDevices.getUserMedia({
 					video: videoSource === "camera" || videoSource === "both",
 					audio: audioSource === "microphone" || audioSource === "both",
@@ -226,49 +223,50 @@ class WebRTCService {
 			stopTracks(userStream);
 			if (err instanceof DOMException) {
 				if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
-					throw makeBroadcastError("PERMISSION_DENIED", "用户拒绝了媒体权限请求。");
+					throw broadcastError("PERMISSION_DENIED", "用户拒绝了媒体权限请求。");
 				}
 				if (err.name === "NotSupportedError" || err.name === "NotFoundError") {
-					throw makeBroadcastError("NOT_SUPPORTED", `此设备不支持所选的媒体配置：${err.message}`);
+					throw broadcastError("NOT_SUPPORTED", `此设备不支持所选的媒体配置：${err.message}`);
 				}
 			}
-			throw makeBroadcastError("UNKNOWN", String(err));
+			throw broadcastError("UNKNOWN", String(err));
 		}
 
-		// Validate screen audio was actually granted
+		// Screen audio must be explicitly shared — browser grants it only if the user
+		// ticks "Share audio" in the permission dialog. Fail fast if it wasn't granted.
 		if ((audioSource === "screen" || audioSource === "both")
 			&& screenStream?.getAudioTracks().length === 0) {
 			stopTracks(screenStream);
 			stopTracks(userStream);
-			throw makeBroadcastError("PERMISSION_DENIED",
+			throw broadcastError("PERMISSION_DENIED",
 				"未获得屏幕声音权限。请在浏览器弹窗中勾选「同时分享音频」后重试。");
 		}
 
+		// Build the combined stream
 		const combined = new MediaStream();
 
-		// Video tracks
 		if (!muteVideo) {
 			if (videoSource === "screen") {
 				screenStream?.getVideoTracks().forEach(t => combined.addTrack(t));
 			} else if (videoSource === "camera") {
 				userStream?.getVideoTracks().forEach(t => combined.addTrack(t));
 			} else if (videoSource === "both" && screenStream && userStream) {
-				this.startCanvasCompositor(screenStream, userStream)
+				this.startCompositor(screenStream, userStream)
 					.getVideoTracks().forEach(t => combined.addTrack(t));
 			}
 		}
 
-		// Audio tracks
 		if (!muteAudio) {
 			if (audioSource === "screen") {
 				screenStream?.getAudioTracks().forEach(t => combined.addTrack(t));
 			} else if (audioSource === "microphone") {
 				userStream?.getAudioTracks().forEach(t => combined.addTrack(t));
 			} else if (audioSource === "both") {
-				const ctx = new AudioContext();
-				const dest = ctx.createMediaStreamDestination();
+				// Mix both sources into one track via AudioContext
+				const audioCtx = new AudioContext();
+				const dest     = audioCtx.createMediaStreamDestination();
 				[screenStream, userStream].forEach(s => {
-					if (s) ctx.createMediaStreamSource(s).connect(dest);
+					if (s) audioCtx.createMediaStreamSource(s).connect(dest);
 				});
 				dest.stream.getAudioTracks().forEach(t => combined.addTrack(t));
 			}
@@ -277,45 +275,44 @@ class WebRTCService {
 		this.localStream = combined;
 		useWebRTCStore.getState().setBroadcasting(true);
 
-		// Collect stream metadata for display
-		// For "both" sources, the combined track label (canvas hash / AudioContext node name)
-		// is meaningless, so we synthesise a friendly label from the raw source tracks.
+		// Synthesise display labels — combined/canvas tracks have meaningless browser-generated
+		// labels, so we read the labels from the raw source tracks before mixing.
 		const screenVideoLabel = screenStream?.getVideoTracks()[0]?.label ?? "";
 		const cameraVideoLabel = userStream?.getVideoTracks()[0]?.label ?? "";
 		const screenAudioLabel = screenStream?.getAudioTracks()[0]?.label ?? "";
 		const micAudioLabel    = userStream?.getAudioTracks()[0]?.label ?? "";
 
-		const videoLabel =
-			videoSource === "both" ? `${screenVideoLabel}	${cameraVideoLabel}`
-			: videoSource === "screen" ? screenVideoLabel
-			: cameraVideoLabel;
+		const videoLabel = videoSource === "both"   ? `${screenVideoLabel}\t${cameraVideoLabel}`
+		                 : videoSource === "screen"  ? screenVideoLabel
+		                 :                             cameraVideoLabel;
 
-		const audioLabel =
-			audioSource === "both" ? `${screenAudioLabel}	${micAudioLabel}`
-			: audioSource === "screen" ? screenAudioLabel
-			: micAudioLabel;
+		const audioLabel = audioSource === "both"        ? `${screenAudioLabel}\t${micAudioLabel}`
+		                 : audioSource === "screen"       ? screenAudioLabel
+		                 :                                  micAudioLabel;
 
-		const videoTrack = combined.getVideoTracks()[0];
-		const audioTrack = combined.getAudioTracks()[0];
-		const vs = videoTrack?.getSettings();
-		const as_ = audioTrack?.getSettings();
+		const videoTrack    = combined.getVideoTracks()[0];
+		const audioTrack    = combined.getAudioTracks()[0];
+		const videoSettings = videoTrack?.getSettings();
+		const audioSettings = audioTrack?.getSettings();
+
 		useWebRTCStore.getState().setStreamInfo({
-			videoMuted: muteVideo,
+			videoMuted:      muteVideo,
 			videoLabel,
-			videoWidth: vs?.width ?? 0,
-			videoHeight: vs?.height ?? 0,
-			audioMuted: muteAudio,
+			videoWidth:      videoSettings?.width      ?? 0,
+			videoHeight:     videoSettings?.height     ?? 0,
+			audioMuted:      muteAudio,
 			audioLabel,
-			audioSampleRate: as_?.sampleRate ?? 0,
+			audioSampleRate: audioSettings?.sampleRate ?? 0,
 		});
 
-		// Stop broadcast automatically if user ends screen share via browser UI
+		// If the user closes the screen-share picker in the browser, stop broadcasting
 		screenStream?.getVideoTracks()[0]?.addEventListener("ended", () => this.stopBroadcast());
 	}
 
 	async handleViewerOffer(viewerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
 		if (!this.localStream) return;
 
+		// Replace any stale connection for this viewer
 		this.viewerPeers.get(viewerId)?.close();
 		const pc = new RTCPeerConnection(RTC_CONFIG);
 		this.viewerPeers.set(viewerId, pc);
@@ -324,13 +321,14 @@ class WebRTCService {
 
 		pc.onicecandidate = ({ candidate }) => {
 			if (candidate) {
-				webSocketService.sendMessage({ type: "ice_candidate", to: viewerId, data: candidate });
+				webSocketService.send({ type: "ice_candidate", to: viewerId, data: candidate });
 			}
 		};
 
 		pc.onconnectionstatechange = () => {
-			const { connectionState } = pc;
-			if (connectionState === "disconnected" || connectionState === "failed" || connectionState === "closed") {
+			if (pc.connectionState === "disconnected"
+				|| pc.connectionState === "failed"
+				|| pc.connectionState === "closed") {
 				this.viewerPeers.delete(viewerId);
 			}
 			useWebRTCStore.getState().setViewerCount(this.viewerPeers.size);
@@ -339,18 +337,20 @@ class WebRTCService {
 		await pc.setRemoteDescription(new RTCSessionDescription(offer));
 		const answer = await pc.createAnswer();
 		await pc.setLocalDescription(answer);
-		webSocketService.sendMessage({ type: "answer", to: viewerId, data: answer });
+		webSocketService.send({ type: "answer", to: viewerId, data: answer });
 	}
 
 	stopBroadcast(): void {
-		this.viewerPeers.forEach((_, viewerId) => {
-			webSocketService.sendMessage({ type: "broadcast_ended", to: viewerId, data: null });
+		// Notify all viewers before closing connections
+		this.viewerPeers.forEach((pc, viewerId) => {
+			webSocketService.send({ type: "broadcast_ended", to: viewerId, data: null });
+			pc.close();
 		});
-		this.stopCanvasCompositor();
+		this.viewerPeers.clear();
+
+		this.stopCompositor();
 		stopTracks(this.localStream);
 		this.localStream = null;
-		this.viewerPeers.forEach(pc => pc.close());
-		this.viewerPeers.clear();
 
 		const store = useWebRTCStore.getState();
 		store.setBroadcasting(false);
@@ -369,7 +369,7 @@ class WebRTCService {
 
 		pc.onicecandidate = ({ candidate }) => {
 			if (candidate) {
-				webSocketService.sendMessage({ type: "ice_candidate", to: broadcasterId, data: candidate });
+				webSocketService.send({ type: "ice_candidate", to: broadcasterId, data: candidate });
 			}
 		};
 
@@ -380,18 +380,21 @@ class WebRTCService {
 		pc.onconnectionstatechange = () => {
 			const { connectionState } = pc;
 			useWebRTCStore.getState().setConnectionState(connectionState);
+			// If the RTC connection drops but the signaling WS is still alive,
+			// the broadcaster is reachable — this is a receiver-side network issue.
 			if ((connectionState === "disconnected" || connectionState === "failed")
 				&& webSocketService.isConnected()) {
 				useWebRTCStore.getState().setDisconnectReason("network");
 			}
 		};
 
+		// Add transceivers before creating the offer so SDP includes both directions
 		pc.addTransceiver("video", { direction: "recvonly" });
 		pc.addTransceiver("audio", { direction: "recvonly" });
 
 		const offer = await pc.createOffer();
 		await pc.setLocalDescription(offer);
-		webSocketService.sendMessage({ type: "offer", to: broadcasterId, data: offer });
+		webSocketService.send({ type: "offer", to: broadcasterId, data: offer });
 	}
 
 	async handleBroadcasterAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
@@ -400,7 +403,7 @@ class WebRTCService {
 
 	requestResolution(maxWidth: number, maxHeight: number): void {
 		if (this.broadcasterPeerId) {
-			webSocketService.sendMessage({
+			webSocketService.send({
 				type: "set_resolution",
 				to: this.broadcasterPeerId,
 				data: { maxWidth, maxHeight },
@@ -417,7 +420,7 @@ class WebRTCService {
 		store.setConnectionState("disconnected");
 		store.setRemoteStream(undefined);
 		this.broadcasterPc?.close();
-		this.broadcasterPc = null;
+		this.broadcasterPc     = null;
 		this.broadcasterPeerId = "";
 	}
 }
