@@ -62,7 +62,8 @@ class WebRTCService {
 	private static instance: WebRTCService;
 
 	// Broadcaster role: one peer connection per viewer
-	private viewerPeers   = new Map<string, RTCPeerConnection>();
+	private viewerPeers      = new Map<string, RTCPeerConnection>();
+	private viewerDisplayIds = new Map<string, string>(); // signalingId → displayId
 	private localStream:    MediaStream | null = null;
 	private animFrameId:    number | null = null;
 
@@ -309,13 +310,14 @@ class WebRTCService {
 		screenStream?.getVideoTracks()[0]?.addEventListener("ended", () => this.stopBroadcast());
 	}
 
-	async handleViewerOffer(viewerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
+	async handleViewerOffer(viewerId: string, offer: RTCSessionDescriptionInit, viewerDisplayId = ""): Promise<void> {
 		if (!this.localStream) return;
 
 		// Replace any stale connection for this viewer
 		this.viewerPeers.get(viewerId)?.close();
 		const pc = new RTCPeerConnection(RTC_CONFIG);
 		this.viewerPeers.set(viewerId, pc);
+		this.viewerDisplayIds.set(viewerId, viewerDisplayId || viewerId);
 
 		this.localStream.getTracks().forEach(t => pc.addTrack(t, this.localStream!));
 
@@ -330,8 +332,11 @@ class WebRTCService {
 				|| pc.connectionState === "failed"
 				|| pc.connectionState === "closed") {
 				this.viewerPeers.delete(viewerId);
+				this.viewerDisplayIds.delete(viewerId);
 			}
-			useWebRTCStore.getState().setViewerCount(this.viewerPeers.size);
+			const store = useWebRTCStore.getState();
+			store.setViewerCount(this.viewerPeers.size);
+			store.setViewerList([...this.viewerDisplayIds.values()]);
 		};
 
 		await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -347,6 +352,7 @@ class WebRTCService {
 			pc.close();
 		});
 		this.viewerPeers.clear();
+		this.viewerDisplayIds.clear();
 
 		this.stopCompositor();
 		stopTracks(this.localStream);

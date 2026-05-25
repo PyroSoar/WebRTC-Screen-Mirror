@@ -1,20 +1,20 @@
 import {
 	Heading, VStack, Button, HStack, Spinner,
-	Text, Spacer, Badge, Box, Checkbox,
+	Text, Spacer, Badge, Box, Checkbox, Input,
 } from "@chakra-ui/react";
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { customAlphabet } from "nanoid/non-secure";
 import {
 	TriangleAlertIcon, MonitorIcon, UsersIcon,
 	CopyIcon, CheckIcon, MicIcon, VideoIcon,
-	InfoIcon, EyeIcon, WifiOffIcon, RefreshCwIcon, MapPinIcon, QrCodeIcon,
+	InfoIcon, EyeIcon, WifiOffIcon, RefreshCwIcon, MapPinIcon, QrCodeIcon, PencilIcon,
 } from "lucide-react";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { useWebSocketStore } from "~/stores/webSocket";
 import { webSocketService } from "~/services/webSocket";
-import { useAuthStore } from "~/stores/auth";
+import { useAuthStore, getDisplayId } from "~/stores/auth";
 import { Alert } from "~/components/ui/alert";
 import { Field } from "~/components/ui/field";
 import { PinInput } from "~/components/ui/pin-input";
@@ -47,9 +47,12 @@ const PIN_SCHEMA = z.object({
 	code: z.string().min(1, "广播码不能为空").length(6, "广播码长度为6位"),
 });
 
-const TOAST_DURATION_MS = 5000;
-const COPY_FEEDBACK_MS = 2000;
+const TOAST_DURATION_MS  = 5000;
+const COPY_FEEDBACK_MS   = 2000;
 const RTC_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+
+// Alphabet for device tag: lowercase letters + digits, no ambiguous chars
+const TAG_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -64,7 +67,7 @@ function getInitialPin(): string | null {
 	return pin && /^\d{6}$/.test(pin) ? pin : null;
 }
 
-// IATA airport code → Chinese city name (Cloudflare PoP codes)
+// IATA airport code → Chinese city name
 const IATA_CITY: Record<string, string> = {
 	AMS:"阿姆斯特丹", ATL:"亚特兰大", BKK:"曼谷", BOM:"孟买", BOS:"波士顿",
 	CAN:"广州", CDG:"巴黎", CPH:"哥本哈根", DEL:"新德里", DFW:"达拉斯",
@@ -90,17 +93,16 @@ let cfLocationCache: CfLocation | null = null;
 async function fetchCfLocation(): Promise<CfLocation | null> {
 	if (cfLocationCache) return cfLocationCache;
 	try {
-		// /cdn-cgi/trace is same-origin on any Cloudflare-proxied site — no CORS needed
 		const res = await fetch("/cdn-cgi/trace", { cache: "no-store" });
 		if (!res.ok) return null;
 		const text = await res.text();
 		const get = (key: string) => text.match(new RegExp(`^${key}=(.+)$`, "m"))?.[1]?.trim() ?? "";
 		const colo = get("colo");
-		const loc = get("loc");
+		const loc  = get("loc");
 		cfLocationCache = {
 			colo,
-			city: IATA_CITY[colo] ?? colo,
-			country: COUNTRY_NAME[loc] ?? loc,
+			city:    IATA_CITY[colo]    ?? colo,
+			country: COUNTRY_NAME[loc]  ?? loc,
 		};
 		return cfLocationCache;
 	} catch {
@@ -109,15 +111,11 @@ async function fetchCfLocation(): Promise<CfLocation | null> {
 }
 
 function formatCfLocation(loc: CfLocation): string {
-	// city already comes from IATA_CITY (Chinese name); country from COUNTRY_NAME
-	// Omit country when it would duplicate city (e.g. Singapore)
 	const parts = (loc.city !== loc.country && loc.country)
-		? `${loc.city}, ${loc.country}`
-		: loc.city;
+		? `${loc.city}, ${loc.country}` : loc.city;
 	return parts ? `${loc.colo} · ${parts}` : loc.colo;
 }
 
-// Raw browser track labels for "both" mode are joined with \t in the service.
 function friendlyVideoLabel(label: string): string {
 	const classify = (raw: string) => {
 		const l = raw.toLowerCase();
@@ -160,9 +158,9 @@ function toggleSet<T>(prev: Set<T>, item: T): Set<T> {
 	return next;
 }
 
-function getShareUrl(id: string): string {
+function getShareUrl(signalingId: string): string {
 	if (typeof window === "undefined") return "";
-	return `${window.location.origin}${window.location.pathname}?pin=${id}`;
+	return `${window.location.origin}${window.location.pathname}?pin=${signalingId}`;
 }
 
 // ─── Route exports ────────────────────────────────────────────────────────────
@@ -175,19 +173,42 @@ export function meta() {
 }
 
 export async function clientLoader() {
-	const { id, setId } = useAuthStore.getState();
-	if (!id) setId(customAlphabet("0123456789", 6)());
+	const store = useAuthStore.getState();
 
-	webSocketService.connect(`wss://signaling.pexni.com/connect?id=${useAuthStore.getState().id}`);
+	// Initialise persistent device identity on first launch
+	if (!store.signalingId) store.setSignalingId(customAlphabet("0123456789", 6)());
+	if (!store.deviceTag)   store.setDeviceTag(customAlphabet(TAG_ALPHABET, 4)());
 
-	webSocketService.registerHandler("offer", ({ from, data }) => {
-		if (useWebRTCStore.getState().isBroadcasting)
-			webRTCService.handleViewerOffer(from, data);
+	const { signalingId, deviceTag, nickname } = useAuthStore.getState();
+	const myDisplayId = getDisplayId(nickname, deviceTag);
+
+	webSocketService.connect(`wss://signaling.pexni.com/connect?id=${signalingId}`);
+
+	// Broadcaster: incoming offer carries the viewer's displayId in metadata
+	webSocketService.registerHandler("offer", ({ from, data, displayId }: any) => {
+		if (useWebRTCStore.getState().isBroadcasting) {
+			webRTCService.handleViewerOffer(from, data, displayId ?? from);
+			// Reply answer carries broadcaster's displayId
+			webSocketService.send({
+				type: "answer_meta",
+				to: from,
+				data: { displayId: myDisplayId },
+			});
+		}
 	});
-	webSocketService.registerHandler("answer", ({ data }) => {
-		if (!useWebRTCStore.getState().isBroadcasting)
+
+	// Viewer: incoming answer
+	webSocketService.registerHandler("answer", ({ data }: any) => {
+		if (!useWebRTCStore.getState().isBroadcasting) {
 			webRTCService.handleBroadcasterAnswer(data);
+		}
 	});
+
+	// Viewer: receive broadcaster's display ID sent alongside the answer
+	webSocketService.registerHandler("answer_meta", ({ data }: any) => {
+		useWebRTCStore.getState().setBroadcasterDisplayId(data?.displayId ?? "");
+	});
+
 	webSocketService.registerHandler("broadcast_ended", () => {
 		useWebRTCStore.getState().setDisconnectReason("broadcaster_stopped");
 	});
@@ -199,47 +220,50 @@ clientLoader.hydrate = true as const;
 // ─── Home ─────────────────────────────────────────────────────────────────────
 
 export default function Home() {
-	const { id } = useAuthStore();
+	const { signalingId, deviceTag, nickname, setNickname } = useAuthStore();
 	const {
 		remoteStream, connectionState, isBroadcasting,
-		viewerCount, streamInfo, disconnectReason,
+		viewerCount, viewerList, streamInfo, disconnectReason, broadcasterDisplayId,
 	} = useWebRTCStore();
 	const { webSocketState } = useWebSocketStore();
 
+	const myDisplayId = getDisplayId(nickname, deviceTag);
+
 	// Refs
-	const videoRef = useRef<HTMLVideoElement>(null);
-	const audioRef = useRef<HTMLAudioElement>(null);
-	const wasConnectedRef = useRef(false);
-	const retryCodeRef = useRef("");
-	const pendingPinFiredRef = useRef(false);
+	const videoRef            = useRef<HTMLVideoElement>(null);
+	const audioRef            = useRef<HTMLAudioElement>(null);
+	const wasConnectedRef     = useRef(false);
+	const retryCodeRef        = useRef("");
+	const pendingPinFiredRef  = useRef(false);
 
 	// UI state
-	const [mode, setMode] = useState<AppMode>(null);
-	const [toast, setToast] = useState<ToastMsg | null>(null);
-	const [cfLocation, setCfLocation] = useState<CfLocation | null>(null);
+	const [mode, setMode]               = useState<AppMode>(null);
+	const [toast, setToast]             = useState<ToastMsg | null>(null);
+	const [cfLocation, setCfLocation]   = useState<CfLocation | null>(null);
+	const [editingName, setEditingName] = useState(false);
+	const [nameInput, setNameInput]     = useState(nickname);
 
 	// Broadcaster state
 	const mobile = useMemo(isMobile, []);
 	const [videoSrcs, setVideoSrcs] = useState<Set<VideoSrc>>(new Set(mobile ? ["camera"] : ["screen"]));
 	const [audioSrcs, setAudioSrcs] = useState<Set<AudioSrc>>(new Set(mobile ? ["microphone"] : ["screen"]));
 	const [codeCopied, setCodeCopied] = useState(false);
-	const [showQr, setShowQr] = useState(false);
+	const [showQr, setShowQr]         = useState(false);
 
 	// Viewer state
 	const [selectedRes, setSelectedRes] = useState("source");
-	const [showInfo, setShowInfo] = useState(false);
-	const [sourceRes, setSourceRes] = useState<Resolution | null>(null);
-	const [currentRes, setCurrentRes] = useState<Resolution | null>(null);
-	const [connBroken, setConnBroken] = useState(false);
-	const [retrying, setRetrying] = useState(false);
+	const [showInfo, setShowInfo]       = useState(false);
+	const [sourceRes, setSourceRes]     = useState<Resolution | null>(null);
+	const [currentRes, setCurrentRes]   = useState<Resolution | null>(null);
+	const [connBroken, setConnBroken]   = useState(false);
+	const [retrying, setRetrying]       = useState(false);
 
-	// URL ?pin= — captured once at init
 	const [pendingPin] = useState(getInitialPin);
 
 	// Derived
-	const isConnected = connectionState === "connected";
+	const isConnected  = connectionState === "connected";
 	const isConnecting = connectionState === "connecting" || connectionState === "new";
-	const hasVideo = useMemo(
+	const hasVideo     = useMemo(
 		() => Boolean(remoteStream?.getVideoTracks().some(t => t.readyState === "live")),
 		[remoteStream],
 	);
@@ -255,18 +279,16 @@ export default function Home() {
 	}, []);
 
 	const showBroadcastError = useCallback((err: BroadcastError) => showToast(
-		err.code === "NOT_SUPPORTED" ? "此设备不支持该功能"
-			: err.code === "PERMISSION_DENIED" ? "权限被拒绝"
-			: "广播失败",
+		err.code === "NOT_SUPPORTED"    ? "此设备不支持该功能"
+		: err.code === "PERMISSION_DENIED" ? "权限被拒绝"
+		: "广播失败",
 		err.message,
 	), [showToast]);
 
 	// ── Effects ────────────────────────────────────────────────────────────────
 
-	// Fetch Cloudflare edge location once
 	useEffect(() => { fetchCfLocation().then(setCfLocation); }, []);
 
-	// Route remote stream to video or audio element; capture initial resolution
 	useEffect(() => {
 		if (!remoteStream || !isConnected) return;
 		const el = hasVideo ? videoRef.current : audioRef.current;
@@ -281,7 +303,6 @@ export default function Home() {
 		return () => vid.removeEventListener("loadedmetadata", onMeta);
 	}, [remoteStream, isConnected, hasVideo]);
 
-	// Poll video element for current resolution; track max as source resolution
 	useEffect(() => {
 		if (!isConnected || !remoteStream) return;
 		const iv = setInterval(() => {
@@ -294,7 +315,6 @@ export default function Home() {
 		return () => clearInterval(iv);
 	}, [isConnected, remoteStream]);
 
-	// Detect connection break (only after we've been connected at least once)
 	useEffect(() => {
 		if (isConnected) {
 			wasConnectedRef.current = true;
@@ -307,7 +327,7 @@ export default function Home() {
 		}
 	}, [connectionState, isConnected]);
 
-	// Auto-retry when viewer loses network connection (exponential backoff)
+	// Auto-retry on viewer network drop (exponential backoff)
 	useEffect(() => {
 		if (!connBroken || disconnectReason !== "network" || !retryCodeRef.current) return;
 		let attempt = 0;
@@ -317,7 +337,7 @@ export default function Home() {
 			setRetrying(true);
 			timer = setTimeout(async () => {
 				try {
-					await webRTCService.connectToBroadcaster(retryCodeRef.current);
+					await connectViewer(retryCodeRef.current);
 					setConnBroken(false);
 					setRetrying(false);
 					wasConnectedRef.current = true;
@@ -332,13 +352,13 @@ export default function Home() {
 		return () => clearTimeout(timer);
 	}, [connBroken, disconnectReason]);
 
-	// Auto-connect from ?pin= URL param — fires once WebSocket is ready
+	// Auto-connect from ?pin= URL param
 	useEffect(() => {
 		if (!pendingPin || pendingPinFiredRef.current || webSocketState !== "connected") return;
 		pendingPinFiredRef.current = true;
 		setMode("viewer");
 		setValue("code", pendingPin, { shouldValidate: true });
-		doConnect(pendingPin);
+		connectViewer(pendingPin);
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [pendingPin, webSocketState]);
 
@@ -347,19 +367,27 @@ export default function Home() {
 		resolver: zodResolver(PIN_SCHEMA),
 	});
 
-	const doConnect = useCallback(async (code: string) => {
+	// Send our displayId alongside the WebRTC offer so the broadcaster knows who we are
+	const connectViewer = useCallback(async (code: string) => {
 		retryCodeRef.current = code;
 		try {
 			await webRTCService.connectToBroadcaster(code);
+			// Tell the broadcaster our display ID via a side-channel message
+			webSocketService.send({
+				type: "viewer_hello",
+				to: code,
+				data: { displayId: myDisplayId },
+			});
 		} catch {
 			showToast("连接失败", "找不到对应的广播，请确认广播码是否正确。");
 		}
-	}, [showToast]);
+	}, [myDisplayId, showToast]);
 
-	const onSubmitViewer = handleSubmit(({ code }) => doConnect(code));
-	const onPinComplete = (value: string) => {
+	const onSubmitViewer = handleSubmit(({ code }) => connectViewer(code));
+	// Defer by one tick to let react-hook-form update its internal state before we submit
+	const onPinComplete  = (value: string) => {
 		setValue("code", value, { shouldValidate: true });
-		setTimeout(() => doConnect(value), 0);
+		setTimeout(() => connectViewer(value), 0);
 	};
 
 	// ── Broadcaster actions ────────────────────────────────────────────────────
@@ -384,26 +412,26 @@ export default function Home() {
 	};
 
 	const onCopyCode = async () => {
-		await navigator.clipboard.writeText(id);
+		await navigator.clipboard.writeText(signalingId);
 		setCodeCopied(true);
 		setTimeout(() => setCodeCopied(false), COPY_FEEDBACK_MS);
 	};
 
 	const onCopyShareLink = () => {
-		navigator.clipboard.writeText(getShareUrl(id));
+		navigator.clipboard.writeText(getShareUrl(signalingId));
 		showToast("已复制", "分享链接已复制到剪贴板。", "success");
 	};
 
 	const onCopyQrCode = async () => {
-		const svg = renderSVG(getShareUrl(id));
+		const svg  = renderSVG(getShareUrl(signalingId));
 		const blob = new Blob([svg], { type: "image/svg+xml" });
 		try {
 			await navigator.clipboard.write([new ClipboardItem({ "image/svg+xml": blob })]);
 			showToast("已复制", "二维码已复制到剪贴板（SVG格式）。", "success");
 		} catch {
 			const a = document.createElement("a");
-			a.href = URL.createObjectURL(blob);
-			a.download = `webbeam-${id}.svg`;
+			a.href     = URL.createObjectURL(blob);
+			a.download = `webbeam-${signalingId}.svg`;
 			a.click();
 			showToast("已下载", "二维码已保存为SVG文件。", "info");
 		}
@@ -418,8 +446,10 @@ export default function Home() {
 		setConnBroken(false);
 		setRetrying(false);
 		wasConnectedRef.current = false;
-		retryCodeRef.current = "";
-		useWebRTCStore.getState().setDisconnectReason(null);
+		retryCodeRef.current    = "";
+		const store = useWebRTCStore.getState();
+		store.setDisconnectReason(null);
+		store.setBroadcasterDisplayId("");
 		webRTCService.disconnectViewer();
 	};
 
@@ -431,6 +461,12 @@ export default function Home() {
 		} catch {
 			showToast("切换失败", "无法切换画质，请稍后重试。");
 		}
+	};
+
+	// ── Nickname editing ───────────────────────────────────────────────────────
+	const onSaveNickname = () => {
+		setNickname(nameInput.trim());
+		setEditingName(false);
 	};
 
 	// ══════════════════════════════════════════════════════════════════════════
@@ -445,6 +481,7 @@ export default function Home() {
 				{/* 1. Status */}
 				<VStack gap={1} textAlign="center">
 					<HStack><MonitorIcon size={20} /><Text fontWeight="semibold">正在广播</Text></HStack>
+					<Text fontSize="xs" color="fg.muted">你的设备ID：{myDisplayId}</Text>
 					<Text fontSize="sm" color="fg.muted">将以下广播码分享给想要观看的人</Text>
 				</VStack>
 
@@ -453,7 +490,7 @@ export default function Home() {
 
 				{/* 3. Pin + copy */}
 				<HStack gap={3}>
-					<Text fontSize="4xl" fontWeight="bold" letterSpacing={6} fontFamily="mono">{id}</Text>
+					<Text fontSize="4xl" fontWeight="bold" letterSpacing={6} fontFamily="mono">{signalingId}</Text>
 					<Button size="sm" variant="ghost" onClick={onCopyCode} title="复制广播码">
 						{codeCopied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
 					</Button>
@@ -483,20 +520,29 @@ export default function Home() {
 				{/* 7. Self-preview */}
 				<SelfPreview localStream={webRTCService.getLocalStream()} />
 
-				{/* 8. Viewer count */}
-				<HStack gap={2}>
-					<UsersIcon size={16} />
-					<Text fontSize="sm">{viewerCount === 0 ? "暂无观看者" : `${viewerCount} 人正在观看`}</Text>
-					{viewerCount > 0 && <Badge colorPalette="green" variant="subtle">{viewerCount}</Badge>}
-				</HStack>
+				{/* 8. Viewer count + list */}
+				<VStack w="full" align="start" gap={2}>
+					<HStack gap={2}>
+						<UsersIcon size={16} />
+						<Text fontSize="sm">{viewerCount === 0 ? "暂无观看者" : `${viewerCount} 人正在观看`}</Text>
+						{viewerCount > 0 && <Badge colorPalette="green" variant="subtle">{viewerCount}</Badge>}
+					</HStack>
+					{viewerList.length > 0 && (
+						<VStack align="start" gap={1} pl={6} w="full">
+							{viewerList.map((vid, i) => (
+								<Text key={i} fontSize="xs" color="fg.muted" fontFamily="mono">{vid}</Text>
+							))}
+						</VStack>
+					)}
+				</VStack>
 
-				{showQr && <QrModal url={getShareUrl(id)} onClose={() => setShowQr(false)} />}
+				{showQr && <QrModal url={getShareUrl(signalingId)} onClose={() => setShowQr(false)} />}
 			</VStack>
 		);
 	}
 
 	// ══════════════════════════════════════════════════════════════════════════
-	// Viewer view (shown while connected OR while connection is broken)
+	// Viewer view
 	// ══════════════════════════════════════════════════════════════════════════
 	if (isConnected || connBroken) {
 		const isBroadcasterStopped = disconnectReason === "broadcaster_stopped";
@@ -507,7 +553,6 @@ export default function Home() {
 			>
 				<WsBanner />
 
-				{/* Media area */}
 				<Box flex={1} position="relative" overflow="hidden">
 					{hasVideo ? (
 						<video ref={videoRef} autoPlay playsInline controls style={{
@@ -560,7 +605,7 @@ export default function Home() {
 											</Button>
 											{!retrying && (
 												<Button size="sm" colorPalette="red" gap={1}
-													onClick={() => doConnect(retryCodeRef.current)}
+													onClick={() => connectViewer(retryCodeRef.current)}
 												>
 													<RefreshCwIcon size={13} />手动重连
 												</Button>
@@ -580,6 +625,9 @@ export default function Home() {
 						>
 							<VStack align="start" gap={1}>
 								<Text fontWeight="bold" fontSize="sm">媒体信息</Text>
+								{broadcasterDisplayId && (
+									<Text>广播方：{broadcasterDisplayId}</Text>
+								)}
 								{hasVideo && <>
 									<Text>原始分辨率：{sourceRes ? `${sourceRes.w}×${sourceRes.h}` : "检测中..."}</Text>
 									<Text>当前分辨率：{currentRes ? `${currentRes.w}×${currentRes.h}` : "检测中..."}</Text>
@@ -632,13 +680,36 @@ export default function Home() {
 	// Landing view
 	// ══════════════════════════════════════════════════════════════════════════
 	return (
-		<VStack p={4} pt={20} h="dvh" gap={6} maxW="sm" mx="auto">
+		<VStack p={4} pt={16} h="dvh" gap={5} maxW="sm" mx="auto">
 			<WsBanner />
 			<Toast msg={toast} onClose={() => setToast(null)} />
 
-			<VStack gap={1} textAlign="center">
+			{/* Device identity */}
+			<VStack gap={1} textAlign="center" w="full">
 				<Heading fontSize="2xl">WebBeam</Heading>
 				<Text fontSize="sm" color="fg.muted">无线投播</Text>
+				<Box pt={2}>
+					{editingName ? (
+						<HStack gap={2} justify="center">
+							<Input
+								size="sm" value={nameInput} maxW="32"
+								placeholder="输入昵称（可留空）"
+								onChange={e => setNameInput(e.target.value)}
+								onKeyDown={e => { if (e.key === "Enter") onSaveNickname(); if (e.key === "Escape") setEditingName(false); }}
+								autoFocus
+							/>
+							<Button size="sm" onClick={onSaveNickname}>保存</Button>
+							<Button size="sm" variant="ghost" onClick={() => setEditingName(false)}>取消</Button>
+						</HStack>
+					) : (
+						<HStack gap={1} justify="center" color="fg.muted">
+							<Text fontSize="xs" fontFamily="mono">{myDisplayId}</Text>
+							<Button size="xs" variant="ghost" onClick={() => { setNameInput(nickname); setEditingName(true); }}>
+								<PencilIcon size={11} />
+							</Button>
+						</HStack>
+					)}
+				</Box>
 			</VStack>
 
 			{mode === null && (
@@ -657,11 +728,7 @@ export default function Home() {
 					<VStack w="full" gap={4} asChild>
 						<form method="post" onSubmit={onSubmitViewer}>
 							<Field label="输入广播码" invalid={!!errors.code} errorText={errors.code?.message} w="full">
-								<PinInput
-									count={6}
-									placeholder=""
-									pattern="\d"
-									autoFocus
+								<PinInput count={6} placeholder="" pattern="\d" autoFocus
 									onValueComplete={d => onPinComplete(d.valueAsString)}
 									{...register("code")}
 								/>
@@ -680,20 +747,20 @@ export default function Home() {
 					<SourceCheckboxGroup
 						label="视频来源" icon={<VideoIcon size={14} />}
 						options={[
-							{ key: "screen", label: "屏幕", hidden: mobile },
-							{ key: "camera", label: "摄像头" },
+							{ key: "screen",  label: "屏幕",   hidden: mobile },
+							{ key: "camera",  label: "摄像头" },
 						]}
 						isChecked={k => videoSrcs.has(k as VideoSrc)}
-						onToggle={k => setVideoSrcs(p => toggleSet(p, k as VideoSrc))}
+						onToggle={k  => setVideoSrcs(p => toggleSet(p, k as VideoSrc))}
 					/>
 					<SourceCheckboxGroup
 						label="音频来源" icon={<MicIcon size={14} />}
 						options={[
-							{ key: "screen", label: "屏幕声音", hidden: mobile },
-							{ key: "microphone", label: "麦克风" },
+							{ key: "screen",     label: "屏幕声音", hidden: mobile },
+							{ key: "microphone", label: "麦克风"   },
 						]}
 						isChecked={k => audioSrcs.has(k as AudioSrc)}
-						onToggle={k => setAudioSrcs(p => toggleSet(p, k as AudioSrc))}
+						onToggle={k  => setAudioSrcs(p => toggleSet(p, k as AudioSrc))}
 					/>
 					<Button w="full" variant="subtle" size="lg" onClick={onStartBroadcast} gap={2}>
 						<MonitorIcon size={18} />开始广播
@@ -719,9 +786,9 @@ function WsBanner() {
 			>
 				<HStack h="6" gap={2}>
 					<Text fontSize="sm">
-						{webSocketState === "connecting" && "正在连接服务器..."}
+						{webSocketState === "connecting"   && "正在连接服务器..."}
 						{webSocketState === "reconnecting" && `重连中（第 ${reconnectAttempts} 次）...`}
-						{isFailed && "服务器连接失败"}
+						{isFailed                          && "服务器连接失败"}
 					</Text>
 					<Spacer />
 					{isFailed && <Button size="xs" onClick={() => webSocketService.reconnect()}>重试</Button>}
@@ -754,7 +821,7 @@ function SourceCheckboxGroup({ label, icon, options, isChecked, onToggle }: {
 	icon: React.ReactNode;
 	options: { key: string; label: string; hidden?: boolean }[];
 	isChecked: (key: string) => boolean;
-	onToggle: (key: string) => void;
+	onToggle:  (key: string) => void;
 }) {
 	return (
 		<VStack align="stretch" gap={2}>
@@ -875,7 +942,6 @@ function SelfPreview({ localStream }: { localStream: MediaStream | null }) {
 			</Button>
 			{expanded && (
 				hasVideoTrack ? (
-					// width:100%, no height constraint — browser respects native aspect ratio
 					<Box borderRadius="md" overflow="hidden" w="full">
 						<video ref={videoRef} autoPlay playsInline muted controls
 							style={{ width: "100%", display: "block" }}
