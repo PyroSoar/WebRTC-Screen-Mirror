@@ -421,6 +421,13 @@ class WebRTCService {
 		return this.localStream;
 	}
 
+	/** Update a viewer's display ID after receiving their viewer_hello message */
+	updateViewerDisplayId(viewerId: string, displayId: string): void {
+		if (!this.viewerPeers.has(viewerId)) return;
+		this.viewerDisplayIds.set(viewerId, displayId);
+		useWebRTCStore.getState().setViewerList([...this.viewerDisplayIds.values()]);
+	}
+
 	disconnectViewer(): void {
 		const store = useWebRTCStore.getState();
 		store.setConnectionState("disconnected");

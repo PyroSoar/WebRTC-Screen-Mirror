@@ -184,16 +184,24 @@ export async function clientLoader() {
 
 	webSocketService.connect(`wss://signaling.pexni.com/connect?id=${signalingId}`);
 
-	// Broadcaster: incoming offer carries the viewer's displayId in metadata
-	webSocketService.registerHandler("offer", ({ from, data, displayId }: any) => {
+	// Broadcaster: handle incoming viewer offer
+	webSocketService.registerHandler("offer", ({ from, data }: any) => {
 		if (useWebRTCStore.getState().isBroadcasting) {
-			webRTCService.handleViewerOffer(from, data, displayId ?? from);
-			// Reply answer carries broadcaster's displayId
+			// Use signalingId as placeholder until viewer_hello arrives with the real displayId
+			webRTCService.handleViewerOffer(from, data, from);
+			// Send our displayId to the viewer alongside the answer
 			webSocketService.send({
 				type: "answer_meta",
 				to: from,
 				data: { displayId: myDisplayId },
 			});
+		}
+	});
+
+	// Broadcaster: viewer announces their display ID after connecting
+	webSocketService.registerHandler("viewer_hello", ({ from, data }: any) => {
+		if (useWebRTCStore.getState().isBroadcasting) {
+			webRTCService.updateViewerDisplayId(from, data?.displayId ?? from);
 		}
 	});
 
